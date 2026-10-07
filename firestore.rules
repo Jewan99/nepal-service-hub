@@ -1,0 +1,170 @@
+rules_version = '2';
+
+// These rules run on Google's servers and are the actual enforcement layer
+// for data integrity — the React validation in src/utils/validation.js is
+// only a convenience for the user. Anything written from a browser, a curl
+// request, or a modified client must pass these checks or it is rejected.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    function isAdmin() {
+      return isSignedIn()
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    function isString(v, minLen, maxLen) {
+      return v is string && v.size() >= minLen && v.size() <= maxLen;
+    }
+
+    // ---- Login attempt counters: server (Cloud Functions) only. ----
+    // No client, authenticated or not, may read or write these directly.
+    // This is what makes the rate limiter in functions/index.js tamper-proof.
+    match /loginAttempts/{docId} {
+      allow read, write: if false;
+    }
+
+    // ---- User profiles ----
+    match /users/{uid} {
+      allow read: if isOwner(uid) || isAdmin();
+      allow create: if isOwner(uid)
+        && isString(request.resource.data.name, 2, 80)
+        && (isString(request.resource.data.email, 5, 254)
+          || (request.resource.data.email == '' && request.auth.token.phone_number is string))
+        && request.resource.data.role in ['customer', 'worker']
+        // Nobody can self-assign verification or admin status on create.
+        && request.resource.data.verified == false
+        && request.resource.data.get('isAdmin', false) == false;
+      allow update: if isOwner(uid)
+        && isString(request.resource.data.name, 2, 80)
+        // A user can edit their own profile, but never flip their own
+        // verified/admin flags — only a trusted backend process can.
+        && request.resource.data.verified == resource.data.verified
+        && request.resource.data.get('isAdmin', false) == resource.data.get('isAdmin', false)
+          && request.resource.data.role == resource.data.role;
+      allow delete: if isOwner(uid);
+    }
+
+    // ---- Worker / provider listings ----
+    match /workers/{uid} {
+      allow read: if true; // public directory — browsable without login
+      allow create: if isOwner(uid)
+        && get(/databases/$(database)/documents/users/$(uid)).data.role == 'worker'
+        && request.resource.data.keys().hasOnly(['name', 'category', 'city', 'rate', 'unit', 'bio', 'verified', 'createdAt', 'updatedAt'])
+        && isString(request.resource.data.name, 2, 80)
+        && isString(request.resource.data.category, 2, 40)
+        && isString(request.resource.data.city, 2, 80)
+        && isString(request.resource.data.bio, 1, 600)
+        && request.resource.data.rate is number
+        && request.resource.data.rate >= 0
+        && request.resource.data.rate <= 200000
+        && request.resource.data.unit in ['visit', 'hour', 'day', 'month', 'session', 'event']
+        && request.resource.data.verified == false
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time;
+      allow update: if isOwner(uid)
+        && get(/databases/$(database)/documents/users/$(uid)).data.role == 'worker'
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'category', 'city', 'rate', 'unit', 'bio', 'updatedAt'])
+        && isString(request.resource.data.name, 2, 80)
+        && isString(request.resource.data.category, 2, 40)
+        && isString(request.resource.data.city, 2, 80)
+        && isString(request.resource.data.bio, 1, 600)
+        && request.resource.data.rate is number
+        && request.resource.data.rate >= 0
+        && request.resource.data.rate <= 200000
+        && request.resource.data.unit in ['visit', 'hour', 'day', 'month', 'session', 'event']
+        && request.resource.data.verified == resource.data.verified
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if isOwner(uid);
+    }
+
+    // ---- Bookings ----
+    match /bookings/{bookingId} {
+      allow create: if isSignedIn()
+        && request.resource.data.customerId == request.auth.uid
+        && isString(request.resource.data.notes, 0, 500);
+      allow read, update: if isSignedIn() && (
+        resource.data.customerId == request.auth.uid ||
+        resource.data.workerId == request.auth.uid
+      );
+      allow delete: if false;
+    }
+
+    // ---- Direct messages ----
+    match /conversations/{conversationId} {
+      allow create: if isSignedIn()
+        && request.resource.data.keys().hasOnly([
+          'customerId', 'workerId', 'customerName', 'workerName', 'participants',
+          'lastMessage', 'lastSenderId', 'lastMessageId', 'createdAt', 'updatedAt'
+        ])
+        && request.resource.data.customerId == request.auth.uid
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'customer'
+        && request.resource.data.customerName == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.name
+        && request.resource.data.workerId is string
+        && request.resource.data.workerId != request.auth.uid
+        && exists(/databases/$(database)/documents/users/$(request.resource.data.workerId))
+        && get(/databases/$(database)/documents/users/$(request.resource.data.workerId)).data.role == 'worker'
+        && exists(/databases/$(database)/documents/workers/$(request.resource.data.workerId))
+        && request.resource.data.workerName == get(/databases/$(database)/documents/workers/$(request.resource.data.workerId)).data.name
+        && request.resource.data.participants is list
+        && request.resource.data.participants.size() == 2
+        && request.resource.data.participants.hasAll([request.resource.data.customerId, request.resource.data.workerId])
+        && isString(request.resource.data.customerName, 1, 80)
+        && isString(request.resource.data.workerName, 1, 80)
+        && request.resource.data.lastMessage == ''
+        && request.resource.data.lastSenderId == ''
+        && request.resource.data.lastMessageId == ''
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time;
+
+      allow read: if isSignedIn() && request.auth.uid in resource.data.participants;
+
+      function hasMatchingLastMessage() {
+        let messagePath = /databases/$(database)/documents/conversations/$(conversationId)/messages/$(request.resource.data.lastMessageId);
+        return existsAfter(messagePath)
+          && getAfter(messagePath).data.senderId == request.auth.uid
+          && getAfter(messagePath).data.text == request.resource.data.lastMessage;
+      }
+
+      allow update: if isSignedIn()
+        && request.auth.uid in resource.data.participants
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastMessage', 'lastSenderId', 'lastMessageId', 'updatedAt'])
+        && isString(request.resource.data.lastMessage, 1, 2000)
+        && request.resource.data.lastSenderId == request.auth.uid
+        && request.resource.data.lastMessageId is string
+        && request.resource.data.lastMessageId.size() > 0
+        && hasMatchingLastMessage()
+        && request.resource.data.updatedAt == request.time;
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        function isThreadParticipant() {
+          return isSignedIn()
+            && request.auth.uid in get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants;
+        }
+
+        allow read: if isThreadParticipant();
+        allow create: if isThreadParticipant()
+          && request.resource.data.keys().hasOnly(['senderId', 'senderName', 'text', 'createdAt'])
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.senderName == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.name
+          && isString(request.resource.data.senderName, 1, 80)
+          && isString(request.resource.data.text, 1, 2000)
+          && request.resource.data.createdAt == request.time;
+        allow update, delete: if false;
+      }
+    }
+
+    // Deny everything else by default.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
